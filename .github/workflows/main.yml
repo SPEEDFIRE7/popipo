@@ -1,0 +1,167 @@
+name: Build Miku UI (self-hosted Ubuntu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Manifest branch"
+        required: true
+        default: "Cinderella"
+      lunch_target:
+        description: "Lunch target (GSI: miku_gsi_phone_arm64 | Device: miku_<codename>)"
+        required: true
+        default: "miku_gsi_phone_arm64"
+      release:
+        description: "Release (check the Miku-UI wiki)"
+        required: true
+        default: "bp1a"
+      build_type:
+        description: "Build type"
+        required: true
+        default: "userdebug"
+        type: choice
+        options: [userdebug, user, eng]
+      make_target:
+        description: "Make target (GSI: systemimage | Device: diva)"
+        required: true
+        default: "systemimage"
+      clean_mode:
+        description: "out = clean junk + out/ (keep synced source) | all = delete everything and start fresh"
+        required: true
+        default: "out"
+        type: choice
+        options: [out, all]
+      min_free_gb:
+        description: "Stop if the best disk has less free space than this (GB)"
+        required: true
+        default: "100"
+      upload_release:
+        description: "Upload result to GitHub Releases"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 1440
+
+    steps:
+      - name: Pick the disk with the most free space
+        shell: bash
+        run: |
+          echo "== All disks =="
+          df -h -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs
+          # best real mount point by free space (skip boot / snap / docker internals)
+          BEST_LINE=$(df -B1G --output=avail,target -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs \
+            | tail -n +2 \
+            | grep -Ev ' /boot| /snap| /var/lib/docker| /run' \
+            | sort -rn | head -1)
+          FREE_GB=$(echo "$BEST_LINE" | awk '{print $1}')
+          MOUNT=$(echo "$BEST_LINE" | awk '{print $2}')
+          echo "Selected mount: $MOUNT with ${FREE_GB} GB free"
+          if [ "$FREE_GB" -lt "${{ inputs.min_free_gb }}" ]; then
+            echo "::error::Not enough free space on $MOUNT (${FREE_GB} GB). Free space or lower min_free_gb."
+            exit 1
+          fi
+          if [ "$MOUNT" = "/" ]; then ROOT="/miku-build"; else ROOT="${MOUNT%/}/miku-build"; fi
+          sudo mkdir -p "$ROOT"
+          sudo chown -R "$(id -u):$(id -g)" "$ROOT"
+          echo "BUILD_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Deep clean
+        shell: bash
+        run: |
+          set +e
+          echo "Free before: $(df -BG --output=avail "$BUILD_ROOT" | tail -1)"
+          sudo apt-get clean
+          sudo apt-get -y autoremove --purge
+          sudo journalctl --vacuum-size=100M
+          sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null
+          rm -rf ~/.cache/* 2>/dev/null
+          if command -v docker >/dev/null 2>&1; then sudo docker system prune -af --volumes; fi
+          rm -rf "$BUILD_ROOT/out_final"
+          if [ "${{ inputs.clean_mode }}" = "all" ]; then
+            echo "Wiping previous source and outputs..."
+            rm -rf "$BUILD_ROOT/miku"
+          else
+            rm -rf "$BUILD_ROOT/miku/out"
+          fi
+          echo "Free after:  $(df -BG --output=avail "$BUILD_ROOT" | tail -1)"
+          exit 0
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          if [ ! -f "$BUILD_ROOT/.deps_done" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+              libc6-dev-i386 libncurses5 x11proto-core-dev libx11-dev lib32z1-dev \
+              libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig python3 \
+              python-is-python3 git-lfs bc rsync lz4 zstd openjdk-17-jdk \
+              libssl-dev libelf-dev ca-certificates ccache
+            touch "$BUILD_ROOT/.deps_done"
+          fi
+          git lfs install
+          mkdir -p "$HOME/bin"
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "builder"
+          git config --global user.email "builder@localhost"
+          git config --global color.ui false
+
+      - name: Sync source code
+        shell: bash
+        run: |
+          mkdir -p "$BUILD_ROOT/miku" && cd "$BUILD_ROOT/miku"
+          repo init -u https://github.com/Miku-UI/manifesto \
+            -b "${{ inputs.branch }}" --git-lfs --depth=1
+          repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags \
+            --optimized-fetch --prune
+          echo "== Disk after sync =="; df -h "$BUILD_ROOT"
+
+      - name: Build
+        shell: bash
+        run: |
+          cd "$BUILD_ROOT/miku"
+          set +u
+          source build/envsetup.sh
+          lunch "${{ inputs.lunch_target }}-${{ inputs.release }}-${{ inputs.build_type }}"
+          make -j"$(nproc)" ${{ inputs.make_target }}
+          echo "== Disk after build =="; df -h "$BUILD_ROOT"
+
+      - name: Collect output
+        shell: bash
+        run: |
+          cd "$BUILD_ROOT/miku"
+          mkdir -p "$BUILD_ROOT/out_final"
+          find out/target/product -maxdepth 2 \
+            \( -name "system.img" -o -name "boot.img" -o -name "vendor_boot.img" \
+               -o -name "super.img" -o -name "*.zip" \) \
+            -exec cp -v {} "$BUILD_ROOT/out_final/" \;
+          cd "$BUILD_ROOT/out_final"
+          if [ -f system.img ]; then
+            zstd -T0 -19 -f system.img -o system.img.zst && rm -f system.img
+          fi
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miku-ui-${{ inputs.lunch_target }}
+          path: ${{ env.BUILD_ROOT }}/out_final/*
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload to Releases
+        if: ${{ inputs.upload_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: miku-${{ inputs.lunch_target }}-${{ github.run_number }}
+          name: Miku UI ${{ inputs.lunch_target }} #${{ github.run_number }}
+          files: ${{ env.BUILD_ROOT }}/out_final/*
